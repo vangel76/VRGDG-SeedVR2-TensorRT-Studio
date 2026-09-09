@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import argparse
 import shutil
 from pathlib import Path
 
@@ -16,13 +17,19 @@ REQUIRED_ENGINES = (
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-sdpa", action="store_true", help="Allow PyTorch attention without optional SageAttention")
+    args = parser.parse_args()
     failures: list[str] = []
     for executable in ("ffmpeg", "ffprobe"):
         if not shutil.which(executable):
             failures.append(f"{executable} is not on PATH")
     if not (ROOT / "vendor" / "seedvr2" / "inference_cli.py").exists():
         failures.append("vendored SeedVR2 source is missing")
-    for module in ("torch", "fastapi", "uvicorn", "tensorrt_rtx", "onnx", "sageattention"):
+    modules = ["torch", "fastapi", "uvicorn", "tensorrt_rtx", "onnx"]
+    if not args.allow_sdpa:
+        modules.append("sageattention")
+    for module in modules:
         try:
             importlib.import_module(module)
         except Exception as exc:

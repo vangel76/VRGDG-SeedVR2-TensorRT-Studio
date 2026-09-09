@@ -17,6 +17,37 @@ Missing accelerated backends do not invalidate a render. SeedVR2 checks what is 
 
 ## Verify SageAttention 2
 
+### Linux / CachyOS
+
+With the main Studio environment installed, run:
+
+```bash
+./scripts/install_sageattention.sh
+```
+
+This builds the official SageAttention **2.2.0** tag for the installed GPU and
+PyTorch environment. It requires the CUDA toolkit (`nvcc`) and a compatible host
+compiler. On this CachyOS setup, GCC 15 and C++20 flags are used with PyTorch 2.14
+and CUDA 13.3. The script selects `gcc-15`/`g++-15` when available; `CC` and `CXX`
+can override that choice. It leaves model downloads and TensorRT engines alone.
+
+Verify the actual SeedVR2 variable-length attention path:
+
+```bash
+.venv/bin/python tools/check_sageattention.py
+```
+
+The check executes FP16 and BF16 CUDA kernels and compares their output with
+SDPA. Select **SageAttention 2** in Studio for subsequent renders. Each render
+starts a fresh inference process, so an already-running render keeps its current
+attention backend. This accelerates attention, not TensorRT VAE decoding.
+
+The UI label selects `sageattn_varlen`, the package's Triton implementation;
+installing version 2.2.0 does not make this integration use every SageAttention2++
+CUDA kernel advertised upstream.
+
+### Windows
+
 From the repository folder:
 
 ~~~powershell

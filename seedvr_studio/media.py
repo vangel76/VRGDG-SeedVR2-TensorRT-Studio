@@ -82,11 +82,33 @@ def probe(path: str | Path) -> VideoInfo:
     return VideoInfo(duration, int(stream["width"]), int(stream["height"]), fps, frames)
 
 
-def make_clip(source: Path, target: Path, start: float, duration: float) -> Path:
+def align_clip_to_frames(start: float, duration: float, fps: float) -> tuple[float, float, int]:
+    """Snap a clip request to whole source frames.
+
+    Returns (aligned_start, aligned_duration, first_frame). The aligned start is the PTS of
+    the first frame; ffmpeg's accurate seek keeps frames with PTS >= the seek time, so seeking
+    to that PTS (rounded down to microseconds) keeps exactly that frame first.
+    """
+    if not fps or fps <= 0:
+        return max(0.0, start), max(0.0, duration), 0
+    first_frame = max(0, int(start * fps + 1e-6))
+    frames = max(1, int(round(duration * fps)))
+    return first_frame / fps, frames / fps, first_frame
+
+
+def make_clip(source: Path, target: Path, start: float, duration: float, fps: float = 0.0) -> Path:
+    """Cut [start, start + duration). With `fps`, boundaries snap to whole frames so the
+    clip's first frame is exactly the source frame shown at `start`."""
     target.parent.mkdir(parents=True, exist_ok=True)
+    seek = f"{max(0.0, start):.3f}"
+    length = f"{max(0.0, duration):.3f}"
+    if fps and fps > 0:
+        aligned_start, aligned_duration, first_frame = align_clip_to_frames(start, duration, fps)
+        seek = f"{math.floor(aligned_start * 1_000_000) / 1_000_000:.6f}"
+        length = f"{aligned_duration:.6f}"
     command = [
-        _tool("ffmpeg"), "-y", "-ss", f"{start:.3f}", "-i", str(source),
-        "-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "0:a?",
+        _tool("ffmpeg"), "-y", "-ss", seek, "-i", str(source),
+        "-t", length, "-map", "0:v:0", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "fast", "-crf", "15",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", str(target),
@@ -135,6 +157,24 @@ def concat_videos(chunks: list[Path], target: Path) -> Path:
     finally:
         listing.unlink(missing_ok=True)
     return target
+
+
+def make_downscaled(source: Path, target: Path, divisor: float) -> Path:
+    """Downscale width and height by `divisor` (even pixels) so SeedVR2 restores a blurry source from less data."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    divisor = max(1.0, float(divisor))
+    run([
+        _tool("ffmpeg"), "-y", "-i", str(source),
+        "-vf", f"scale=trunc(iw/{2 * divisor:g})*2:trunc(ih/{2 * divisor:g})*2:flags=lanczos",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "15",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(target),
+    ])
+    return target
+
+
+def make_half_size(source: Path, target: Path) -> Path:
+    return make_downscaled(source, target, 2.0)
 
 
 def make_center_crop(source: Path, target: Path, aspect_ratio: float = 16 / 9) -> Path:

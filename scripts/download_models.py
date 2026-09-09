@@ -21,6 +21,15 @@ def main() -> int:
         print("Model download failed. Run this installer again to resume.", file=sys.stderr)
         return 1
     print(f"Default SeedVR2 models are ready in {model_dir}")
+    face_dir = ROOT / "models" / "faces"
+    print("Downloading face restoration weights (CodeFormer, GFPGAN, RetinaFace, ParseNet)...")
+    try:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from face_restore import WEIGHTS, ensure_weights  # noqa: E402
+        ensure_weights(list(WEIGHTS), face_dir)
+        print(f"Face restoration weights are ready in {face_dir}")
+    except Exception as exc:  # optional feature: never fail the install for it
+        print(f"Face restoration weights could not be downloaded now ({exc}); they download on first use.", file=sys.stderr)
     return 0
 
 

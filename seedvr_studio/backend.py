@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ from typing import Callable
 
 from .media import MediaError, probe, resolve_frame_rate
 from .paths import MODELS, ROOT, SEEDVR_CLI, VENV_PYTHON
+from .postprocess_runner import run_postprocess_jobs
 
 
 TRT_RUNNER = ROOT / "tools" / "run_tensorrt_tiled.py"
@@ -20,6 +22,9 @@ TRT_ARTIFACTS = ROOT / "tensorrt_backend" / "artifacts"
 TRT_ENGINE_21F = TRT_ARTIFACTS / "vae_decoder_tile_256_21f.rtxplan"
 TRT_ENGINE_5F = TRT_ARTIFACTS / "vae_decoder_tile_512_5f.rtxplan"
 TRT_POSTPROCESS = ROOT / "tools" / "postprocess_tensor_video.py"
+RTX_VSR_RUNNER = ROOT / "tools" / "run_rtx_vsr.py"
+RTX_BACKEND = "RTX Video Super Resolution"
+RTX_QUALITIES = ("BICUBIC", "LOW", "MEDIUM", "HIGH", "ULTRA")
 TRT_ENCODER_5F = TRT_ARTIFACTS / "vae_encoder_5f_tile512.rtxplan"
 TRT_ENCODER_21F = TRT_ARTIFACTS / "vae_encoder_21f_tile512.rtxplan"
 
@@ -62,6 +67,12 @@ class RenderSettings:
     seam_frames: int = 2
     decoder_mode: str = "stable"
     source_fps: float = 0.0
+    face_model: str = "none"
+    face_strength: float = 0.5
+    face_fidelity: float = 0.7
+    face_detail: float = 0.5
+    face_min_size: int = 64
+    rtx_quality: str = "ULTRA"
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -98,6 +109,70 @@ def tensorrt_status() -> tuple[bool, str]:
     return True, "TensorRT Stable and Optimized decoders ready (temporal batches 5 and 21)."
 
 
+def rtx_status() -> tuple[bool, str]:
+    """NVIDIA Video Effects SDK bindings (nvidia-vfx) present and loadable?"""
+    try:
+        import nvvfx  # noqa: F401
+    except Exception as exc:  # ImportError or a failed native load
+        return False, f"RTX Video Super Resolution unavailable: {exc}"
+    if not RTX_VSR_RUNNER.exists():
+        return False, f"RTX runner missing: {RTX_VSR_RUNNER}"
+    return True, "RTX Video Super Resolution ready (NVIDIA Video Effects SDK)."
+
+
+def render_rtx_vsr(source: Path, output: Path, settings: RenderSettings, progress_callback: ProgressCallback | None) -> Path:
+    """Upscale with NVIDIA RTX VSR; reuse the Studio post stage when any post effect is enabled."""
+    from .tensorrt_pipeline import _unpadded_output_size, postprocess_and_assemble
+
+    available, reason = rtx_status()
+    if not available:
+        raise MediaError(reason)
+    info = probe(source)
+    fps = resolve_frame_rate(settings.source_fps, info.fps)
+    target_width, target_height = _unpadded_output_size(source, settings.resolution, settings.max_resolution)
+    quality = settings.rtx_quality if settings.rtx_quality in RTX_QUALITIES else "ULTRA"
+    face_active = settings.face_model in {"codeformer", "gfpgan"} and float(settings.face_strength) > 0
+    wants_post = (settings.sharpen_enabled or settings.grain_enabled or settings.microtexture_enabled or settings.skin_finishing_enabled
+                  or settings.color_correction != "none" or face_active)
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    decoded_dir = output.parent / "tensorrt_decoded"
+    command = [str(VENV_PYTHON), "-u", str(RTX_VSR_RUNNER), str(source), "--width", str(target_width), "--height", str(target_height),
+               "--src-width", str(info.width), "--src-height", str(info.height), "--fps", f"{fps:.9g}", "--quality", quality,
+               "--frames", str(int(info.frames or 0)), "--batch-frames", str(settings.batch_size if settings.batch_size in (5, 21) else 21)]
+    command += ["--batches-dir", str(decoded_dir)] if wants_post else ["--output", str(output)]
+    if progress_callback:
+        progress_callback(0.02, f"RTX Video Super Resolution ({quality}) {info.width}x{info.height} -> {target_width}x{target_height}")
+    process = subprocess.Popen(command, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace",
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    tail: deque[str] = deque(maxlen=60)
+    assert process.stdout is not None
+    span = 0.85 if wants_post else 0.97
+    for raw_line in process.stdout:
+        line = raw_line.rstrip()
+        tail.append(line)
+        _safe_print(line)
+        match = re.search(r"RTX_PROGRESS (\d+)/(\d+)", line)
+        if match and progress_callback:
+            done, total = int(match.group(1)), max(1, int(match.group(2)))
+            progress_callback(0.02 + span * done / total, f"RTX upscaling frame {done} of {total}")
+    if process.wait():
+        raise MediaError("RTX Video Super Resolution failed:\n" + "\n".join(tail))
+    if not wants_post:
+        if not output.exists():
+            raise MediaError("RTX Video Super Resolution finished but wrote no output file")
+        if progress_callback:
+            progress_callback(1.0, "RTX Video Super Resolution complete")
+        return output
+    decoded_files = sorted(decoded_dir.glob("decoded_*.pt"))
+    if not decoded_files:
+        raise MediaError("RTX Video Super Resolution wrote no frame batches")
+    # RTX frames are continuous across batches: no seam treatment needed.
+    return postprocess_and_assemble(output, source, decoded_files, settings, child_env, progress_callback, seam_mode="off",
+                                    done_message="RTX Video Super Resolution complete", progress_base=0.87, progress_span=0.10)
+
+
 def _progress_from_log(line: str) -> tuple[float, str] | None:
     patterns = (
         (r"Validating .+", 0.03, 0.00, "Validating model files"),
@@ -130,6 +205,8 @@ def render(
     settings: RenderSettings,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
+    if backend_name == RTX_BACKEND or backend_name.startswith("RTX"):
+        return render_rtx_vsr(source, output, settings, progress_callback)
     available, reason = backend_status()
     if not available:
         raise MediaError(reason + " Run scripts\\setup_seedvr2.ps1 first.")
@@ -254,6 +331,12 @@ def reprocess_tensorrt(
     seed: int,
     seam_mode: str,
     seam_frames: int,
+    color_correction: str = "none",
+    face_model: str = "none",
+    face_strength: float = 0.5,
+    face_fidelity: float = 0.7,
+    face_detail: float = 0.5,
+    face_min_size: int = 64,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
     """Rebuild a TensorRT result from saved decoded batches without rerunning SeedVR2."""
@@ -263,6 +346,11 @@ def reprocess_tensorrt(
         raise MediaError("This result has no saved raw TensorRT decoded batches to reprocess.")
     seam_mode = seam_mode if seam_mode in {"off", "noise", "match", "blend"} else "off"
     seam_frames = max(1, min(12, int(seam_frames)))
+    try:  # RTX VSR batches are continuous frames: seam treatment would only alter boundary frames
+        if str(json.loads((job_dir / "job-manifest.json").read_text(encoding="utf-8")).get("backend", "")).startswith("RTX"):
+            seam_mode = "off"
+    except (OSError, ValueError):
+        pass
     child_env = os.environ.copy()
     child_env["PYTHONUTF8"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
@@ -270,42 +358,56 @@ def reprocess_tensorrt(
     frame_start = 0
     reprocess_dir = job_dir / f"post-{output.stem}"
     reprocess_dir.mkdir(parents=True, exist_ok=True)
-    if grain_enabled:
+    color_correction = color_correction if color_correction in {"none", "lab", "wavelet", "wavelet_adaptive", "hsv", "adain"} else "none"
+    source_fps = resolve_frame_rate(probe(source).fps)
+    target_width = target_height = 0
+    if color_correction != "none":
+        try:
+            manifest_settings = json.loads((job_dir / "job-manifest.json").read_text(encoding="utf-8")).get("settings", {})
+            from .tensorrt_pipeline import _unpadded_output_size
+            target_width, target_height = _unpadded_output_size(source, int(manifest_settings["resolution"]), int(manifest_settings["max_resolution"]))
+        except (OSError, ValueError, KeyError, TypeError, MediaError):
+            target_width = target_height = 0
+    face_model = face_model if face_model in {"none", "codeformer", "gfpgan"} else "none"
+    face_active = face_model != "none" and float(face_strength) > 0
+    face_state = reprocess_dir / "face-track-state.json"
+    face_state.unlink(missing_ok=True)
+    needs_frame_index = grain_enabled or color_correction != "none" or face_active
+    if needs_frame_index:
         import torch
+    wants_post = sharpen_enabled or grain_enabled or microtexture_enabled or skin_finishing_enabled or color_correction != "none" or face_active
+    jobs: list[dict[str, object]] = []
     for index, decoded in enumerate(decoded_files, start=1):
         frame_count = 0
-        if grain_enabled:
+        if needs_frame_index:
             payload = torch.load(decoded, map_location="cpu", weights_only=False)
             video = payload["video"] if isinstance(payload, dict) and "video" in payload else payload
-            frame_count = int(payload.get("original_frames", video.shape[2])) if isinstance(payload, dict) else int(video.shape[2])
+            frame_count = int(payload.get("original_frames") or video.shape[2]) if isinstance(payload, dict) else int(video.shape[2])
             del payload, video
-        if sharpen_enabled or grain_enabled or microtexture_enabled or skin_finishing_enabled:
-            processed = reprocess_dir / f"processed_{index:03d}.pt"
-            command = [str(VENV_PYTHON), str(TRT_POSTPROCESS), str(decoded),
-                       "--output", str(processed), "--frame-start", str(frame_start),
-                       "--seed", str(seed),
-                       "--sharpen-strength", str(sharpen_strength if sharpen_enabled else 0.0),
-                       "--microtexture-strength", str(microtexture_strength if microtexture_enabled else 0.0),
-                       "--skin-evenness", str(skin_evenness if skin_finishing_enabled else 0.0),
-                       "--skin-smoothing", str(skin_smoothing if skin_finishing_enabled else 0.0),
-                       "--skin-redness", str(skin_redness if skin_finishing_enabled else 0.0),
-                       "--skin-shine", str(skin_shine if skin_finishing_enabled else 0.0),
-                       "--blemish-mode", blemish_mode if skin_finishing_enabled else "off",
-                       "--grain-intensity", str(grain_intensity if grain_enabled else 0.0),
-                       "--grain-saturation", str(grain_saturation)]
-            if skin_finishing_enabled and preserve_marks:
-                command.append("--preserve-marks")
-            result = subprocess.run(command, cwd=ROOT, env=child_env, text=True,
-                                    encoding="utf-8", errors="replace", capture_output=True)
-            _safe_print(result.stdout, end="")
-            if result.returncode:
-                raise MediaError(f"TensorRT post-processing failed:\n{result.stderr[-4000:]}")
-            selected_files.append(processed)
-        else:
-            selected_files.append(decoded)
+        jobs.append({"input": str(decoded), "output": str(reprocess_dir / f"processed_{index:03d}.pt"), "frame_start": frame_start})
         frame_start += frame_count
-        if progress_callback:
-            progress_callback(0.75 * index / len(decoded_files), f"Post-processing batch {index} of {len(decoded_files)}")
+    if wants_post:
+        common = ["--seed", str(seed),
+                  "--color-correction", color_correction, "--source", str(source), "--source-fps", f"{source_fps:.9g}",
+                  "--target-width", str(target_width), "--target-height", str(target_height),
+                  "--face-model", face_model if face_active else "none", "--face-strength", str(face_strength), "--face-fidelity", str(face_fidelity),
+                  "--face-detail", str(face_detail), "--face-min-size", str(int(face_min_size)), "--face-state", str(face_state),
+                  "--sharpen-strength", str(sharpen_strength if sharpen_enabled else 0.0),
+                  "--microtexture-strength", str(microtexture_strength if microtexture_enabled else 0.0),
+                  "--skin-evenness", str(skin_evenness if skin_finishing_enabled else 0.0),
+                  "--skin-smoothing", str(skin_smoothing if skin_finishing_enabled else 0.0),
+                  "--skin-redness", str(skin_redness if skin_finishing_enabled else 0.0),
+                  "--skin-shine", str(skin_shine if skin_finishing_enabled else 0.0),
+                  "--blemish-mode", blemish_mode if skin_finishing_enabled else "off",
+                  "--grain-intensity", str(grain_intensity if grain_enabled else 0.0),
+                  "--grain-saturation", str(grain_saturation)]
+        if skin_finishing_enabled and preserve_marks:
+            common.append("--preserve-marks")
+        run_postprocess_jobs(jobs, common, reprocess_dir / "postprocess-jobs.json", child_env, progress_callback,
+                             progress_base=0.05, progress_span=0.70, label="Post-processing")
+        selected_files = [Path(job["output"]) for job in jobs]
+    else:
+        selected_files = list(decoded_files)
     if progress_callback:
         progress_callback(0.8, "Applying seam treatment and assembling video")
     command = [str(VENV_PYTHON), str(TRT_ASSEMBLER), *map(str, selected_files),

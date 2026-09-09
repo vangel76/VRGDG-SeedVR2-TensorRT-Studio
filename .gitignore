@@ -4,6 +4,7 @@ models/
 !vendor/seedvr2/src/models/
 !vendor/seedvr2/src/models/**
 __pycache__/
+*.egg-info/
 *.pyc
 *.log
 tensorrt_backend/engines/

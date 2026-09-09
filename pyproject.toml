@@ -9,6 +9,8 @@ dependencies = [
   "uvicorn>=0.32",
   "pillow>=10.4",
   "pip-system-certs>=5.3",
+  "facexlib>=0.3",
+  "nvidia-vfx>=0.1.0.1",
 ]
 [tool.setuptools.packages.find]
 include = ["seedvr_studio*"]

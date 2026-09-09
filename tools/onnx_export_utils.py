@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from contextlib import nullcontext
+import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -17,9 +18,25 @@ def _math_attention_context():
         return nullcontext()
 
 
+@contextmanager
+def _portable_convolutions():
+    # The VAE workaround calls aten::cudnn_convolution directly, which has no
+    # ONNX symbolic. Use ordinary Conv3d during export, retaining cuDNN's
+    # memory-efficient implementation instead of allocating an im2col buffer.
+    causal = sys.modules.get("src.models.video_vae_v3.modules.causal_inflation_lib")
+    original = getattr(causal, "NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND", None)
+    if original is not None:
+        causal.NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = False
+    try:
+        yield
+    finally:
+        if original is not None:
+            causal.NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND = original
+
+
 def _portable_export(module: torch.nn.Module, args: tuple[torch.Tensor, ...], output: Path, *, legacy: bool) -> None:
     is_encoder = args[0].ndim == 5 and args[0].shape[1] == 3
-    with torch.inference_mode(), torch.backends.cudnn.flags(enabled=False), _math_attention_context():
+    with torch.inference_mode(), _portable_convolutions(), _math_attention_context():
         torch.onnx.export(
             module,
             args,

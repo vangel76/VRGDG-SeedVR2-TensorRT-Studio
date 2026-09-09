@@ -37,6 +37,9 @@ TensorRT engines are built locally for the installed GPU and runtime. Do not cop
 
 ## Quick start
 
+**Linux / CachyOS:** use `./scripts/install.sh`, then `./run.sh`.
+See the [Linux setup guide](docs/LINUX.md) for prerequisites and validation.
+
 1. Download or clone this repository.
 2. Double-click **Install SeedVR Studio.bat** and leave the window open until setup completes.
 3. Double-click **Launch SeedVR Studio Pro.bat**.
@@ -149,6 +152,7 @@ Every job receives its own folder under `outputs\` with rendered media, manifest
 |---|---|---:|---|
 | **SeedVR2 + TensorRT** | Recommended accelerated workflow | 5, 21 | Uses TensorRT VAE decoding and automatic fallback from saved latents. |
 | **SeedVR2 (Legacy)** | Compatibility and additional batch choices | SeedVR2-compatible values | Standard PyTorch path; can be substantially slower on long videos. |
+| **RTX Video Super Resolution** | Very fast upscaling of clean sources | Any size up to 4× per pass (larger factors chain passes) | NVIDIA Video Effects SDK (`nvidia-vfx`); no SeedVR2 model, hundreds of frames per second. Post effects, face restoration and reprocess still apply. |
 
 The temporal-batch menu updates automatically when the render engine changes.
 

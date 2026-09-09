@@ -15,6 +15,7 @@ from .cancellation import cancellation_requested
 from .media import MediaError, probe, resolve_frame_rate
 from .paths import ROOT, VENV_PYTHON
 from .persistent_decoder import run_persistent_decoder
+from .postprocess_runner import run_postprocess_jobs
 
 
 TRT_RUNNER = ROOT / "tools" / "run_tensorrt_tiled.py"
@@ -184,43 +185,58 @@ def decode_postprocess_and_assemble(
         decoded_files = _stable_decode(profiles, child_env, progress_callback)
         record["used"] = "stable"
     record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return postprocess_and_assemble(output, source, decoded_files, settings, child_env, progress_callback,
+                                    done_message=f"TensorRT render complete · decoder: {record['used']}")
 
+
+def postprocess_and_assemble(
+    output: Path, source: Path, decoded_files: list[Path], settings: Any, child_env: dict[str, str],
+    progress_callback: ProgressCallback | None, *, seam_mode: str | None = None, done_message: str = "Render complete",
+    progress_base: float = 0.90, progress_span: float = 0.06,
+) -> Path:
+    """Run the optional post stage on decoded batches, then assemble the MP4 (shared by TensorRT and RTX VSR)."""
+    decoded_dir = output.parent / "tensorrt_decoded"
+    decoded_dir.mkdir(parents=True, exist_ok=True)
     selected_files: list[Path] = []
-    for index, decoded in enumerate(decoded_files, start=1):
-        if settings.sharpen_enabled or settings.grain_enabled or settings.microtexture_enabled or settings.skin_finishing_enabled:
-            processed = decoded_dir / f"processed_{index:03d}.pt"
-            effects = [
-                str(VENV_PYTHON), str(TRT_POSTPROCESS), str(decoded), "--output", str(processed),
-                "--frame-start", str((index - 1) * settings.batch_size), "--seed", str(settings.seed),
-                "--sharpen-strength", str(settings.sharpen_strength if settings.sharpen_enabled else 0.0),
-                "--microtexture-strength", str(settings.microtexture_strength if settings.microtexture_enabled else 0.0),
-                "--skin-evenness", str(settings.skin_evenness if settings.skin_finishing_enabled else 0.0),
-                "--skin-smoothing", str(settings.skin_smoothing if settings.skin_finishing_enabled else 0.0),
-                "--skin-redness", str(settings.skin_redness if settings.skin_finishing_enabled else 0.0),
-                "--skin-shine", str(settings.skin_shine if settings.skin_finishing_enabled else 0.0),
-                "--blemish-mode", settings.blemish_mode if settings.skin_finishing_enabled else "off",
-                "--grain-intensity", str(settings.grain_intensity if settings.grain_enabled else 0.0),
-                "--grain-saturation", str(settings.grain_saturation),
-            ]
-            if settings.skin_finishing_enabled and settings.preserve_marks:
-                effects.append("--preserve-marks")
-            effect_result = subprocess.run(
-                effects, cwd=ROOT, env=child_env, text=True, encoding="utf-8", errors="replace", capture_output=True
-            )
-            _safe_print(effect_result.stdout, end="")
-            if effect_result.returncode:
-                raise MediaError(f"TensorRT post-processing failed:\n{effect_result.stderr[-4000:]}")
-            selected_files.append(processed)
-        else:
-            selected_files.append(decoded)
-
+    color_mode = str(getattr(settings, "color_correction", "none") or "none")
+    face_model = str(getattr(settings, "face_model", "none") or "none")
+    face_active = face_model in {"codeformer", "gfpgan"} and float(getattr(settings, "face_strength", 0.0)) > 0
+    face_state = decoded_dir / "face-track-state.json"
+    face_state.unlink(missing_ok=True)
     source_fps = resolve_frame_rate(getattr(settings, "source_fps", 0.0), probe(source).fps)
-    target_width, target_height = _unpadded_output_size(
-        source, settings.resolution, settings.max_resolution
-    )
+    target_width, target_height = _unpadded_output_size(source, settings.resolution, settings.max_resolution)
+    wants_post = settings.sharpen_enabled or settings.grain_enabled or settings.microtexture_enabled or settings.skin_finishing_enabled or color_mode != "none" or face_active
+    if wants_post:
+        common = [
+            "--seed", str(settings.seed),
+            "--color-correction", color_mode, "--source", str(source), "--source-fps", f"{source_fps:.9g}",
+            "--target-width", str(target_width), "--target-height", str(target_height),
+            "--face-model", face_model if face_active else "none", "--face-strength", str(getattr(settings, "face_strength", 0.5)),
+            "--face-fidelity", str(getattr(settings, "face_fidelity", 0.7)), "--face-detail", str(getattr(settings, "face_detail", 0.5)),
+            "--face-min-size", str(int(getattr(settings, "face_min_size", 64))), "--face-state", str(face_state),
+            "--sharpen-strength", str(settings.sharpen_strength if settings.sharpen_enabled else 0.0),
+            "--microtexture-strength", str(settings.microtexture_strength if settings.microtexture_enabled else 0.0),
+            "--skin-evenness", str(settings.skin_evenness if settings.skin_finishing_enabled else 0.0),
+            "--skin-smoothing", str(settings.skin_smoothing if settings.skin_finishing_enabled else 0.0),
+            "--skin-redness", str(settings.skin_redness if settings.skin_finishing_enabled else 0.0),
+            "--skin-shine", str(settings.skin_shine if settings.skin_finishing_enabled else 0.0),
+            "--blemish-mode", settings.blemish_mode if settings.skin_finishing_enabled else "off",
+            "--grain-intensity", str(settings.grain_intensity if settings.grain_enabled else 0.0),
+            "--grain-saturation", str(settings.grain_saturation),
+        ]
+        if settings.skin_finishing_enabled and settings.preserve_marks:
+            common.append("--preserve-marks")
+        jobs = [{"input": str(decoded), "output": str(decoded_dir / f"processed_{index:03d}.pt"), "frame_start": (index - 1) * settings.batch_size}
+                for index, decoded in enumerate(decoded_files, start=1)]
+        run_postprocess_jobs(jobs, common, decoded_dir / "postprocess-jobs.json", child_env, progress_callback,
+                             progress_base=progress_base, progress_span=progress_span, label="Post-processing")
+        selected_files = [Path(job["output"]) for job in jobs]
+    else:
+        selected_files = list(decoded_files)
+
     assemble = [
         str(VENV_PYTHON), str(TRT_ASSEMBLER), *map(str, selected_files), "--output", str(output),
-        "--audio", str(source), "--fps", f"{source_fps:.9g}", "--seam-mode", settings.seam_mode, "--seam-frames", str(settings.seam_frames),
+        "--audio", str(source), "--fps", f"{source_fps:.9g}", "--seam-mode", seam_mode or settings.seam_mode, "--seam-frames", str(settings.seam_frames),
         "--target-width", str(target_width), "--target-height", str(target_height),
     ]
     result = subprocess.run(
@@ -230,5 +246,5 @@ def decode_postprocess_and_assemble(
     if result.returncode:
         raise MediaError(f"TensorRT video assembly failed:\n{result.stderr[-4000:]}")
     if progress_callback:
-        progress_callback(1.0, f"TensorRT render complete · decoder: {record['used']}")
+        progress_callback(1.0, done_message)
     return output

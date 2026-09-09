@@ -85,8 +85,10 @@ class PersistentDecoder:
             wx = feather(out_tile, out_overlap, x != xs[0], x != xs[-1], tile_output.device)
             window = (wy[:, None] * wx[None, :]).view(1, 1, 1, out_tile, out_tile)
             oy, ox = y * 8, x * 8
-            result[:, :, :, oy:oy + out_tile, ox:ox + out_tile] += tile_output.float() * window
-            weights[:, :, :, oy:oy + out_tile, ox:ox + out_tile] += window
+            valid_h, valid_w = min(out_tile, out_h - oy), min(out_tile, out_w - ox)
+            window = window[..., :valid_h, :valid_w]
+            result[..., oy:oy + valid_h, ox:ox + valid_w] += tile_output[..., :valid_h, :valid_w].float() * window
+            weights[..., oy:oy + valid_h, ox:ox + valid_w] += window
         elapsed = time.perf_counter() - started
         result = (result / weights.clamp_min(1e-6)).clamp(-2.0, 2.0)
         decoded = result[:, :, :, :out_h, :out_w].cpu()
